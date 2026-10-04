@@ -1,3 +1,4 @@
+import { once } from 'node:events'
 import { readFile } from 'node:fs/promises'
 import { endianness, homedir, hostname, tmpdir } from 'node:os'
 import path from 'node:path'
@@ -50,8 +51,9 @@ export async function runWasm (file, options = {}) {
   const lifetime = new MessageChannel()
   lifetime.port1.start()
   lifetime.port1.ref()
+  let threads
   try {
-    const threads = new WASIThreads({
+    threads = new WASIThreads({
       wasi,
       reuseWorker: { size: workerCount, strict: false },
       // New WebContainer workers need the supervisor to service imports during startup.
@@ -98,7 +100,7 @@ export async function runWasm (file, options = {}) {
   } finally {
     closing = true
     try {
-      await shutdown({ operations, workers, closeFilesystem, cancelFilesystemWaits, memory, atomicControls }, errors)
+      await shutdown({ operations, workers, threads, closeFilesystem, cancelFilesystemWaits, memory, atomicControls }, errors)
     } finally {
       lifetime.port1.close()
       lifetime.port2.close()
@@ -117,7 +119,13 @@ async function shutdown (runtime, errors) {
   }
   runtime.cancelFilesystemWaits()
   for (const control of runtime.atomicControls) cancelAtomicWaits(runtime.memory, control)
-  await Promise.all(runtime.workers.map(worker => worker.terminate())).catch(error => errors.push(error))
+  await Promise.all(runtime.workers.map(async worker => {
+    if (worker.threadId === -1) return
+    const exited = once(worker, 'exit')
+    if (runtime.threads) runtime.threads.PThread.terminateWorker(worker)
+    else void worker.terminate()
+    await exited
+  })).catch(error => errors.push(error))
   // Imports remain serviced until termination so pending RPC and thread-spawn waits can finish.
   for (const worker of runtime.workers) worker.removeAllListeners('message')
   try {
